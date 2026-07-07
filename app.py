@@ -1,6 +1,4 @@
 import base64
-import io
-import os
 
 import streamlit as st
 from anthropic import Anthropic
@@ -18,6 +16,7 @@ except ImportError:
 
 MODEL_NAME = "claude-sonnet-5"  # Claude Sonnet 5 (claude-3-5-sonnet הוצא משימוש ב-API)
 MAX_TOKENS = 4096
+IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp"}
 
 st.set_page_config(
     page_title="עוזר סיכום מסמכים",
@@ -68,10 +67,38 @@ st.markdown(
     [data-testid="stFileUploaderDropzone"] {
         direction: rtl;
     }
+
+    [data-testid="stChatInput"] textarea {
+        direction: rtl;
+        text-align: right;
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
+
+
+def init_session_state() -> None:
+    """מאתחל את מפתחות ה-session_state שבהם נשמר כל המידע הזמני של הסשן.
+
+    כל הערכים חיים אך ורק בזיכרון הסשן של Streamlit: רענון הדף או סגירת
+    הלשונית פותחים חיבור/סשן חדש ומאפסים אותם לחלוטין, ללא כל שמירה קבועה.
+    """
+    defaults = {
+        "merged_text": "",   # "תיבת האם" - הטקסט המלא והממוזג מכל הקבצים שהועלו
+        "summary": "",       # הסיכום הממוקד שנוצר מתוך תיבת האם
+        "qa_history": [],    # רשימת (שאלה, תשובה) של שאלות ההמשך על הסיכום
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def reset_session_state() -> None:
+    st.session_state.merged_text = ""
+    st.session_state.summary = ""
+    st.session_state.qa_history = []
+
 
 def get_api_key() -> str:
     try:
@@ -129,10 +156,54 @@ def image_to_base64(uploaded_file) -> tuple[str, str]:
     return encoded, media_type
 
 
-def build_system_prompt(focus: str) -> str:
+def extract_text_from_image(api_key: str, uploaded_file) -> str:
+    """מבקש מ-Claude לתמלל/לתאר את תוכן התמונה, כדי שגם קבצי תמונה יזינו
+    את אותה תיבת טקסט מרכזית כמו PDF ו-Word."""
+    client = Anthropic(api_key=api_key)
+    encoded, media_type = image_to_base64(uploaded_file)
+    response = client.messages.create(
+        model=MODEL_NAME,
+        max_tokens=MAX_TOKENS,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": media_type, "data": encoded},
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "תמלל ותאר במדויק ובעברית את כל הטקסט והתוכן הרלוונטי "
+                            "המופיע בתמונה הזו, ללא פרשנות או תוספות משלך."
+                        ),
+                    },
+                ],
+            }
+        ],
+    )
+    return "".join(block.text for block in response.content if block.type == "text").strip()
+
+
+def extract_text_from_upload(api_key: str, uploaded_file) -> str:
+    """מחלץ טקסט מקובץ יחיד בהתאם לסיומת שלו (PDF / Word / תמונה)."""
+    name = uploaded_file.name
+    extension = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+
+    if extension == "pdf":
+        return extract_text_from_pdf(uploaded_file)
+    if extension == "docx":
+        return extract_text_from_docx(uploaded_file)
+    if extension in IMAGE_EXTENSIONS:
+        return extract_text_from_image(api_key, uploaded_file)
+    raise ValueError(f"סוג קובץ לא נתמך: .{extension}")
+
+
+def build_summary_system_prompt(focus: str) -> str:
     return (
         "אתה עוזר כתיבה מומחה בעברית תקנית וגבוהה. "
-        "המשימה שלך היא לקרוא את התוכן שיסופק לך (טקסט, מסמך או תמונה) "
+        "המשימה שלך היא לקרוא את התוכן שיסופק לך (שעשוי להיות ממוזג ממספר מסמכים) "
         "ולכתוב ממנו סיכום בעברית רהוטה, תקנית ומדויקת, ללא שום שגיאות כתיב או ניקוד שגוי. "
         "התמקד אך ורק בהיבט הבא שביקש המשתמש, והשמט כל מידע שאינו רלוונטי אליו: "
         f"\"{focus}\". "
@@ -141,40 +212,46 @@ def build_system_prompt(focus: str) -> str:
     )
 
 
-def call_claude(api_key: str, focus: str, text_content: str = None, image_data: tuple = None) -> str:
+def build_followup_system_prompt() -> str:
+    return (
+        "אתה עוזר כתיבה מומחה בעברית תקנית וגבוהה. "
+        "בהמשך תקבל את התוכן המלא של המסמכים שהועלו, את הסיכום הממוקד שכבר הוכן מהם, "
+        "ולבסוף שאלת המשך של המשתמשת. "
+        "ענה על השאלה בעברית ברורה ומדויקת, בהתבסס אך ורק על התוכן המלא ועל הסיכום שסופקו לך. "
+        "אם התשובה לשאלה אינה נמצאת במידע שסופק, ציין זאת בבירור במקום לנחש."
+    )
+
+
+def call_claude_summary(api_key: str, focus: str, merged_text: str) -> str:
     client = Anthropic(api_key=api_key)
-    system_prompt = build_system_prompt(focus)
-
-    content = []
-    if image_data:
-        encoded, media_type = image_data
-        content.append(
-            {
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": media_type,
-                    "data": encoded,
-                },
-            }
-        )
-        content.append({"type": "text", "text": "אנא סכם את התמונה בהתאם להנחיות שקיבלת."})
-    else:
-        content.append(
-            {
-                "type": "text",
-                "text": f"להלן התוכן לסיכום:\n\n{text_content}",
-            }
-        )
-
     response = client.messages.create(
         model=MODEL_NAME,
         max_tokens=MAX_TOKENS,
-        system=system_prompt,
-        messages=[{"role": "user", "content": content}],
+        system=build_summary_system_prompt(focus),
+        messages=[
+            {"role": "user", "content": f"להלן התוכן לסיכום:\n\n{merged_text}"},
+        ],
     )
     return "".join(block.text for block in response.content if block.type == "text").strip()
 
+
+def call_claude_followup(api_key: str, merged_text: str, summary: str, question: str) -> str:
+    client = Anthropic(api_key=api_key)
+    user_message = (
+        f"התוכן המלא של המסמכים שהועלו:\n\n{merged_text}\n\n"
+        f"---\n\nהסיכום שכבר הוכן מהתוכן:\n\n{summary}\n\n"
+        f"---\n\nשאלת ההמשך של המשתמשת:\n{question}"
+    )
+    response = client.messages.create(
+        model=MODEL_NAME,
+        max_tokens=MAX_TOKENS,
+        system=build_followup_system_prompt(),
+        messages=[{"role": "user", "content": user_message}],
+    )
+    return "".join(block.text for block in response.content if block.type == "text").strip()
+
+
+init_session_state()
 
 st.title("📝 עוזר סיכום מסמכים")
 
@@ -186,68 +263,120 @@ if not api_key:
 
 focus = st.text_input("במה להתמקד בסיכום?", placeholder="לדוגמה: המסקנות העיקריות וההמלצות בלבד")
 
-input_mode = st.radio("בחרו את אופן הקלט:", ["העלאת קובץ", "הזנת טקסט"], horizontal=True)
+input_mode = st.radio("בחרו את אופן הקלט:", ["העלאת קבצים", "הזנת טקסט"], horizontal=True)
 
-uploaded_file = None
+uploaded_files = None
 manual_text = ""
 
-if input_mode == "העלאת קובץ":
-    uploaded_file = st.file_uploader(
-        "העלו קובץ PDF, Word (docx) או תמונה (png/jpg/jpeg/webp)",
+if input_mode == "העלאת קבצים":
+    uploaded_files = st.file_uploader(
+        "העלו קובץ אחד או יותר: PDF, Word (docx) או תמונה (png/jpg/jpeg/webp)",
         type=["pdf", "docx", "png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=True,
     )
 else:
     manual_text = st.text_area("הזינו את הטקסט לסיכום:", height=250)
 
-generate = st.button("צור סיכום", type="primary")
+col_generate, col_reset = st.columns([3, 1])
+generate = col_generate.button("צור סיכום", type="primary")
+reset_clicked = col_reset.button("🗑️ נקה הכל")
+
+if reset_clicked:
+    reset_session_state()
+    st.rerun()
 
 if generate:
     if not focus.strip():
         st.error("יש לציין במה להתמקד בסיכום.")
         st.stop()
 
-    text_content = None
-    image_data = None
+    merged_parts = []
 
-    if input_mode == "העלאת קובץ":
-        if uploaded_file is None:
-            st.error("יש להעלות קובץ.")
+    if input_mode == "העלאת קבצים":
+        if not uploaded_files:
+            st.error("יש להעלות לפחות קובץ אחד.")
             st.stop()
 
-        file_name = uploaded_file.name.lower()
-        with st.spinner("מחלץ תוכן מהקובץ..."):
-            if file_name.endswith(".pdf"):
-                text_content = extract_text_from_pdf(uploaded_file)
-                if not text_content:
-                    st.warning("לא נמצא טקסט הניתן לחילוץ מה-PDF (ייתכן שמדובר בסריקה). נסו קובץ תמונה במקום.")
+        with st.spinner(f"מחלץ תוכן מ-{len(uploaded_files)} קבצים..."):
+            for uploaded_file in uploaded_files:
+                try:
+                    extracted = extract_text_from_upload(api_key, uploaded_file)
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"אירעה שגיאה בחילוץ תוכן מהקובץ '{uploaded_file.name}': {exc}")
                     st.stop()
-            elif file_name.endswith(".docx"):
-                text_content = extract_text_from_docx(uploaded_file)
-                if not text_content:
-                    st.warning("לא נמצא טקסט במסמך ה-Word.")
-                    st.stop()
-            else:
-                image_data = image_to_base64(uploaded_file)
+
+                if not extracted:
+                    st.warning(
+                        f"לא נמצא תוכן הניתן לחילוץ בקובץ '{uploaded_file.name}' "
+                        "(ייתכן שמדובר ב-PDF סרוק ללא טקסט). הקובץ דולג."
+                    )
+                    continue
+
+                merged_parts.append(f"### קובץ: {uploaded_file.name}\n\n{extracted}")
+
+        if not merged_parts:
+            st.error("לא נמצא תוכן הניתן לחילוץ באף אחד מהקבצים שהועלו.")
+            st.stop()
     else:
         if not manual_text.strip():
             st.error("יש להזין טקסט לסיכום.")
             st.stop()
-        text_content = manual_text.strip()
+        merged_parts.append(manual_text.strip())
+
+    merged_text = "\n\n---\n\n".join(merged_parts)
 
     with st.spinner("Claude מכין את הסיכום..."):
         try:
-            summary = call_claude(api_key, focus.strip(), text_content=text_content, image_data=image_data)
+            summary = call_claude_summary(api_key, focus.strip(), merged_text)
         except Exception as exc:  # noqa: BLE001
             st.error(f"אירעה שגיאה בקריאה ל-API של Anthropic: {exc}")
             st.stop()
 
+    st.session_state.merged_text = merged_text
+    st.session_state.summary = summary
+    st.session_state.qa_history = []
+
+if st.session_state.summary:
     st.divider()
     st.subheader("📄 הסיכום")
     with st.container(border=True):
-        st.markdown(summary)
+        st.markdown(st.session_state.summary)
     st.download_button(
         "הורידו את הסיכום כקובץ טקסט",
-        data=summary.encode("utf-8"),
+        data=st.session_state.summary.encode("utf-8"),
         file_name="summary.txt",
         mime="text/plain",
     )
+
+    st.divider()
+    st.subheader("💬 שאלות המשך על הסיכום")
+    st.caption("אפשר לשאול הבהרות נוספות על סמך כל התוכן שהועלה ועל סמך הסיכום שנוצר.")
+
+    for question, answer in st.session_state.qa_history:
+        with st.chat_message("user"):
+            st.markdown(question)
+        with st.chat_message("assistant"):
+            st.markdown(answer)
+
+    followup_question = st.chat_input("שאלו שאלה נוספת או בקשו הבהרה על הסיכום...")
+
+    if followup_question:
+        with st.chat_message("user"):
+            st.markdown(followup_question)
+
+        with st.spinner("Claude מכין תשובה..."):
+            try:
+                answer = call_claude_followup(
+                    api_key,
+                    st.session_state.merged_text,
+                    st.session_state.summary,
+                    followup_question,
+                )
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"אירעה שגיאה בקריאה ל-API של Anthropic: {exc}")
+                st.stop()
+
+        with st.chat_message("assistant"):
+            st.markdown(answer)
+
+        st.session_state.qa_history.append((followup_question, answer))
