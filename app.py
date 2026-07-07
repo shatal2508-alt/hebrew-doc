@@ -1,4 +1,5 @@
 import base64
+import concurrent.futures
 import json
 
 import streamlit as st
@@ -15,10 +16,16 @@ try:
 except ImportError:
     Document = None
 
+try:
+    import fitz  # PyMuPDF - להפיכת עמודי PDF סרוקים לתמונות לצורך OCR
+except ImportError:
+    fitz = None
+
 
 MODEL_NAME = "claude-sonnet-5"  # Claude Sonnet 5 (claude-3-5-sonnet הוצא משימוש ב-API)
 MAX_TOKENS = 4096
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp"}
+MAX_PARALLEL_REQUESTS = 5  # מספר קריאות API מקביליות מקסימלי (חילוץ קבצים / תמלול עמודים)
 
 st.set_page_config(
     page_title="עוזר סיכום מסמכים",
@@ -206,13 +213,21 @@ def get_api_key() -> str:
     return key_input.strip()
 
 
-def extract_text_from_pdf(uploaded_file) -> str:
+def extract_text_from_pdf(api_key: str, uploaded_file) -> str:
     if PdfReader is None:
         st.error("הספרייה pypdf אינה מותקנת. הריצו: pip install pypdf")
         st.stop()
     reader = PdfReader(uploaded_file)
     pages_text = [page.extract_text() or "" for page in reader.pages]
-    return "\n\n".join(pages_text).strip()
+    text = "\n\n".join(pages_text).strip()
+    if text:
+        return text
+
+    # לא נמצאה שכבת טקסט - כנראה PDF סרוק (תמונה של דף, לא טקסט אמיתי).
+    # נופלים חזרה על הפיכת כל עמוד לתמונה ו"קריאתו" ע"י Claude, כמו קובץ תמונה רגיל.
+    if fitz is None:
+        return ""
+    return _ocr_scanned_pdf(api_key, uploaded_file.getvalue())
 
 
 def extract_text_from_docx(uploaded_file) -> str:
@@ -229,8 +244,8 @@ def extract_text_from_docx(uploaded_file) -> str:
     return "\n".join(parts).strip()
 
 
-def image_to_base64(uploaded_file) -> tuple[str, str]:
-    extension = uploaded_file.name.rsplit(".", 1)[-1].lower()
+def get_image_media_type(file_name: str) -> str:
+    extension = file_name.rsplit(".", 1)[-1].lower()
     media_type_map = {
         "png": "image/png",
         "jpg": "image/jpeg",
@@ -238,17 +253,13 @@ def image_to_base64(uploaded_file) -> tuple[str, str]:
         "gif": "image/gif",
         "webp": "image/webp",
     }
-    media_type = media_type_map.get(extension, "image/png")
-    raw_bytes = uploaded_file.getvalue()
-    encoded = base64.standard_b64encode(raw_bytes).decode("utf-8")
-    return encoded, media_type
+    return media_type_map.get(extension, "image/png")
 
 
-def extract_text_from_image(api_key: str, uploaded_file) -> str:
-    """מבקש מ-Claude לתמלל/לתאר את תוכן התמונה, כדי שגם קבצי תמונה יזינו
-    את אותה תיבת טקסט מרכזית כמו PDF ו-Word."""
+def _transcribe_image_bytes(api_key: str, image_bytes: bytes, media_type: str) -> str:
+    """מבקש מ-Claude לתמלל/לתאר תמונה בודדת (גם עמוד PDF שהופך לתמונה)."""
     client = Anthropic(api_key=api_key)
-    encoded, media_type = image_to_base64(uploaded_file)
+    encoded = base64.standard_b64encode(image_bytes).decode("utf-8")
     response = client.messages.create(
         model=MODEL_NAME,
         max_tokens=MAX_TOKENS,
@@ -274,13 +285,41 @@ def extract_text_from_image(api_key: str, uploaded_file) -> str:
     return "".join(block.text for block in response.content if block.type == "text").strip()
 
 
+def extract_text_from_image(api_key: str, uploaded_file) -> str:
+    """מבקש מ-Claude לתמלל/לתאר את תוכן התמונה, כדי שגם קבצי תמונה יזינו
+    את אותה תיבת טקסט מרכזית כמו PDF ו-Word."""
+    media_type = get_image_media_type(uploaded_file.name)
+    return _transcribe_image_bytes(api_key, uploaded_file.getvalue(), media_type)
+
+
+def _ocr_scanned_pdf(api_key: str, pdf_bytes: bytes) -> str:
+    """הופך כל עמוד ב-PDF סרוק לתמונה, ומתמלל את כל העמודים במקביל
+    (במקום בזה-אחר-זה) כדי לקצר את זמן ההמתנה."""
+    document = fitz.open(stream=pdf_bytes, filetype="pdf")
+    zoom_matrix = fitz.Matrix(200 / 72, 200 / 72)  # ~200 DPI - רזולוציה סבירה לתמלול
+    page_images = [page.get_pixmap(matrix=zoom_matrix).tobytes("png") for page in document]
+    document.close()
+
+    if not page_images:
+        return ""
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(len(page_images), MAX_PARALLEL_REQUESTS)
+    ) as executor:
+        page_texts = list(
+            executor.map(lambda img: _transcribe_image_bytes(api_key, img, "image/png"), page_images)
+        )
+
+    return "\n\n".join(text for text in page_texts if text).strip()
+
+
 def extract_text_from_upload(api_key: str, uploaded_file) -> str:
     """מחלץ טקסט מקובץ יחיד בהתאם לסיומת שלו (PDF / Word / תמונה)."""
     name = uploaded_file.name
     extension = name.rsplit(".", 1)[-1].lower() if "." in name else ""
 
     if extension == "pdf":
-        return extract_text_from_pdf(uploaded_file)
+        return extract_text_from_pdf(api_key, uploaded_file)
     if extension == "docx":
         return extract_text_from_docx(uploaded_file)
     if extension in IMAGE_EXTENSIONS:
@@ -424,22 +463,42 @@ if generate:
             st.error("יש להעלות לפחות קובץ אחד.")
             st.stop()
 
-        with st.spinner(f"מחלץ תוכן מ-{len(uploaded_files)} קבצים..."):
-            for uploaded_file in uploaded_files:
-                try:
-                    extracted = extract_text_from_upload(api_key, uploaded_file)
-                except Exception as exc:  # noqa: BLE001
-                    st.error(f"אירעה שגיאה בחילוץ תוכן מהקובץ '{uploaded_file.name}': {exc}")
-                    st.stop()
+        with st.spinner(f"מחלץ תוכן מ-{len(uploaded_files)} קבצים (במקביל)..."):
+            # מריצים את החילוץ של כל הקבצים בו-זמנית (במקום אחד-אחרי-השני),
+            # כדי שזמן ההמתנה הכולל יהיה בערך כמו הקובץ הכי איטי, ולא סכום כל הקבצים.
+            extraction_results: list = [None] * len(uploaded_files)
+            extraction_errors: list = [None] * len(uploaded_files)
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(len(uploaded_files), MAX_PARALLEL_REQUESTS)
+            ) as executor:
+                future_to_index = {
+                    executor.submit(extract_text_from_upload, api_key, uploaded_file): idx
+                    for idx, uploaded_file in enumerate(uploaded_files)
+                }
+                for future in concurrent.futures.as_completed(future_to_index):
+                    idx = future_to_index[future]
+                    try:
+                        extraction_results[idx] = future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        extraction_errors[idx] = exc
 
-                if not extracted:
-                    st.warning(
-                        f"לא נמצא תוכן הניתן לחילוץ בקובץ '{uploaded_file.name}' "
-                        "(ייתכן שמדובר ב-PDF סרוק ללא טקסט). הקובץ דולג."
-                    )
-                    continue
+        first_error_idx = next((i for i, exc in enumerate(extraction_errors) if exc is not None), None)
+        if first_error_idx is not None:
+            st.error(
+                f"אירעה שגיאה בחילוץ תוכן מהקובץ '{uploaded_files[first_error_idx].name}': "
+                f"{extraction_errors[first_error_idx]}"
+            )
+            st.stop()
 
-                merged_parts.append(f"### קובץ: {uploaded_file.name}\n\n{extracted}")
+        for uploaded_file, extracted in zip(uploaded_files, extraction_results):
+            if not extracted:
+                st.warning(
+                    f"לא נמצא תוכן הניתן לחילוץ בקובץ '{uploaded_file.name}' "
+                    "(ייתכן שמדובר ב-PDF סרוק שגם התמלול האוטומטי שלו לא הצליח). הקובץ דולג."
+                )
+                continue
+
+            merged_parts.append(f"### קובץ: {uploaded_file.name}\n\n{extracted}")
 
         if not merged_parts:
             st.error("לא נמצא תוכן הניתן לחילוץ באף אחד מהקבצים שהועלו.")
