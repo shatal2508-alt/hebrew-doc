@@ -102,27 +102,63 @@ def reset_session_state() -> None:
     st.session_state.qa_history = []
 
 
+def _get_streamlit_theme_base() -> str:
+    """מנסה לזהות אם ה-Theme הפעיל של Streamlit (כפי שהמשתמשת בחרה באפליקציה)
+    הוא 'light' או 'dark', כדי להתאים את צבעי כפתור ההעתקה בהתאם.
+    מוחזר מחרוזת ריקה אם האפיון לא זמין בגרסת Streamlit הנוכחית."""
+    try:
+        return st.context.theme.type
+    except Exception:  # noqa: BLE001 - התכונה לא קיימת בכל גרסה, זהו fallback מכוון
+        return ""
+
+
 def render_copy_button(text: str, key: str, label: str = "📋 העתק טקסט") -> None:
     """מרנדר כפתור מעוצב להעתקת טקסט ללוח (clipboard) של המכשיר.
 
     משתמש ב-navigator.clipboard.writeText עם נפילה חזרה ל-execCommand,
-    כדי שיעבוד גם בדפדפני מובייל ישנים יותר.
+    כדי שיעבוד גם בדפדפני מובייל ישנים יותר. הכפתור רץ בתוך iframe נפרד
+    (components.html), ולכן צריך להתאים את הרקע/הצבעים שלו ידנית ל-Theme
+    הפעיל של Streamlit — אחרת הוא מופיע כקופסה לבנה מנותקת במצב Dark Mode.
     """
     safe_text = json.dumps(text)
     button_id = f"copy-btn-{key}"
+
+    theme_base = _get_streamlit_theme_base()
+    if theme_base == "dark":
+        forced_style = "color: #fafafa !important; border-color: rgba(250, 250, 250, 0.35) !important;"
+    elif theme_base == "light":
+        forced_style = "color: #31333F !important; border-color: rgba(49, 51, 63, 0.3) !important;"
+    else:
+        forced_style = ""
+
     html_code = f"""
-    <div style="direction: rtl; text-align: right; font-family: 'Assistant', sans-serif;">
-      <button id="{button_id}" style="
-          width: 100%;
-          border-radius: 8px;
-          font-weight: 600;
-          padding: 0.5rem 1rem;
-          border: 1px solid rgba(49, 51, 63, 0.2);
-          background-color: transparent;
-          color: inherit;
-          cursor: pointer;
-          font-size: 0.95rem;
-      ">{label}</button>
+    <style>
+      html, body {{
+        background: transparent !important;
+        margin: 0;
+      }}
+      .copy-btn {{
+        width: 100%;
+        box-sizing: border-box;
+        border-radius: 8px;
+        font-weight: 600;
+        padding: 0.5rem 1rem;
+        cursor: pointer;
+        font-size: 0.95rem;
+        font-family: 'Assistant', sans-serif;
+        border: 1px solid rgba(49, 51, 63, 0.3);
+        background-color: transparent;
+        color: #31333F;
+      }}
+      @media (prefers-color-scheme: dark) {{
+        .copy-btn {{
+          color: #fafafa;
+          border-color: rgba(250, 250, 250, 0.35);
+        }}
+      }}
+    </style>
+    <div style="direction: rtl; text-align: right;">
+      <button id="{button_id}" class="copy-btn" style="{forced_style}">{label}</button>
     </div>
     <script>
       (function() {{
@@ -291,7 +327,19 @@ def call_claude_summary(api_key: str, focus: str, merged_text: str) -> str:
         max_tokens=MAX_TOKENS,
         system=build_summary_system_prompt(focus),
         messages=[
-            {"role": "user", "content": f"להלן התוכן לסיכום:\n\n{merged_text}"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"להלן התוכן לסיכום:\n\n{merged_text}",
+                        # מסמנים את בלוק המסמכים כ"בר-שמירה" (ephemeral cache) כדי שקריאות
+                        # המשך שישתמשו באותו תוכן מדויק ישלמו רק על קריאת מטמון זולה,
+                        # ולא על עיבוד מלא מחדש של כל המסמכים.
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                ],
+            },
         ],
     )
     return "".join(block.text for block in response.content if block.type == "text").strip()
@@ -299,16 +347,33 @@ def call_claude_summary(api_key: str, focus: str, merged_text: str) -> str:
 
 def call_claude_followup(api_key: str, merged_text: str, summary: str, question: str) -> str:
     client = Anthropic(api_key=api_key)
-    user_message = (
+    cached_context = (
         f"התוכן המלא של המסמכים שהועלו:\n\n{merged_text}\n\n"
-        f"---\n\nהסיכום שכבר הוכן מהתוכן:\n\n{summary}\n\n"
-        f"---\n\nשאלת ההמשך של המשתמשת:\n{question}"
+        f"---\n\nהסיכום שכבר הוכן מהתוכן:\n\n{summary}"
     )
     response = client.messages.create(
         model=MODEL_NAME,
         max_tokens=MAX_TOKENS,
         system=build_followup_system_prompt(),
-        messages=[{"role": "user", "content": user_message}],
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": cached_context,
+                        # אותו בלוק תוכן מדויק (מסמכים + סיכום) חוזר על עצמו בכל שאלת המשך
+                        # באותה שיחה, ולכן הוא מועמד מושלם למטמון: החל מהשאלה השנייה
+                        # משלמים רק על קריאת מטמון זולה במקום על כל הטקסט מחדש.
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                    {
+                        "type": "text",
+                        "text": f"---\n\nשאלת ההמשך של המשתמשת:\n{question}",
+                    },
+                ],
+            },
+        ],
     )
     return "".join(block.text for block in response.content if block.type == "text").strip()
 
