@@ -359,9 +359,11 @@ def build_followup_system_prompt() -> str:
     )
 
 
-def call_claude_summary(api_key: str, focus: str, merged_text: str) -> str:
+def stream_claude_summary(api_key: str, focus: str, merged_text: str):
+    """Generator שמזרים את הסיכום מ-Claude חתיכת-טקסט אחרי חתיכת-טקסט (Streaming),
+    כדי שאפשר יהיה להציג אותו באתר בזמן אמת עם st.write_stream."""
     client = Anthropic(api_key=api_key)
-    response = client.messages.create(
+    with client.messages.stream(
         model=MODEL_NAME,
         max_tokens=MAX_TOKENS,
         system=build_summary_system_prompt(focus),
@@ -380,17 +382,18 @@ def call_claude_summary(api_key: str, focus: str, merged_text: str) -> str:
                 ],
             },
         ],
-    )
-    return "".join(block.text for block in response.content if block.type == "text").strip()
+    ) as stream:
+        yield from stream.text_stream
 
 
-def call_claude_followup(api_key: str, merged_text: str, summary: str, question: str) -> str:
+def stream_claude_followup(api_key: str, merged_text: str, summary: str, question: str):
+    """Generator שמזרים את תשובת ההמשך מ-Claude חתיכת-טקסט אחרי חתיכת-טקסט."""
     client = Anthropic(api_key=api_key)
     cached_context = (
         f"התוכן המלא של המסמכים שהועלו:\n\n{merged_text}\n\n"
         f"---\n\nהסיכום שכבר הוכן מהתוכן:\n\n{summary}"
     )
-    response = client.messages.create(
+    with client.messages.stream(
         model=MODEL_NAME,
         max_tokens=MAX_TOKENS,
         system=build_followup_system_prompt(),
@@ -413,8 +416,8 @@ def call_claude_followup(api_key: str, merged_text: str, summary: str, question:
                 ],
             },
         ],
-    )
-    return "".join(block.text for block in response.content if block.type == "text").strip()
+    ) as stream:
+        yield from stream.text_stream
 
 
 init_session_state()
@@ -450,6 +453,8 @@ reset_clicked = col_reset.button("🗑️ נקה הכל")
 if reset_clicked:
     reset_session_state()
     st.rerun()
+
+summary_freshly_streamed = False
 
 if generate:
     if not focus.strip():
@@ -511,22 +516,26 @@ if generate:
 
     merged_text = "\n\n---\n\n".join(merged_parts)
 
-    with st.spinner("Claude מכין את הסיכום..."):
+    st.divider()
+    st.subheader("📄 הסיכום")
+    with st.container(border=True):
         try:
-            summary = call_claude_summary(api_key, focus.strip(), merged_text)
+            summary = st.write_stream(stream_claude_summary(api_key, focus.strip(), merged_text))
         except Exception as exc:  # noqa: BLE001
             st.error(f"אירעה שגיאה בקריאה ל-API של Anthropic: {exc}")
             st.stop()
+    summary_freshly_streamed = True
 
     st.session_state.merged_text = merged_text
     st.session_state.summary = summary
     st.session_state.qa_history = []
 
 if st.session_state.summary:
-    st.divider()
-    st.subheader("📄 הסיכום")
-    with st.container(border=True):
-        st.markdown(st.session_state.summary)
+    if not summary_freshly_streamed:
+        st.divider()
+        st.subheader("📄 הסיכום")
+        with st.container(border=True):
+            st.markdown(st.session_state.summary)
     render_copy_button(st.session_state.summary, key="summary")
     st.download_button(
         "הורידו את הסיכום כקובץ טקסט",
@@ -552,20 +561,21 @@ if st.session_state.summary:
         with st.chat_message("user"):
             st.markdown(followup_question)
 
-        with st.spinner("Claude מכין תשובה..."):
+        with st.chat_message("assistant"):
             try:
-                answer = call_claude_followup(
-                    api_key,
-                    st.session_state.merged_text,
-                    st.session_state.summary,
-                    followup_question,
+                answer = st.write_stream(
+                    stream_claude_followup(
+                        api_key,
+                        st.session_state.merged_text,
+                        st.session_state.summary,
+                        followup_question,
+                    )
                 )
             except Exception as exc:  # noqa: BLE001
                 st.error(f"אירעה שגיאה בקריאה ל-API של Anthropic: {exc}")
                 st.stop()
-
-        with st.chat_message("assistant"):
-            st.markdown(answer)
+            # render_copy_button מגיע רק אחרי ש-st.write_stream סיים לחלוטין (קריאה חוסמת
+            # עד תום ההזרמה), כך שהכפתור תמיד מעתיק את הטקסט המלא ולא תשובה חלקית.
             render_copy_button(answer, key=f"qa-{len(st.session_state.qa_history)}")
 
         st.session_state.qa_history.append((followup_question, answer))
