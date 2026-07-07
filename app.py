@@ -1,6 +1,8 @@
 import base64
+import json
 
 import streamlit as st
+import streamlit.components.v1 as components
 from anthropic import Anthropic
 
 try:
@@ -98,6 +100,56 @@ def reset_session_state() -> None:
     st.session_state.merged_text = ""
     st.session_state.summary = ""
     st.session_state.qa_history = []
+
+
+def render_copy_button(text: str, key: str, label: str = "📋 העתק טקסט") -> None:
+    """מרנדר כפתור מעוצב להעתקת טקסט ללוח (clipboard) של המכשיר.
+
+    משתמש ב-navigator.clipboard.writeText עם נפילה חזרה ל-execCommand,
+    כדי שיעבוד גם בדפדפני מובייל ישנים יותר.
+    """
+    safe_text = json.dumps(text)
+    button_id = f"copy-btn-{key}"
+    html_code = f"""
+    <div style="direction: rtl; text-align: right; font-family: 'Assistant', sans-serif;">
+      <button id="{button_id}" style="
+          width: 100%;
+          border-radius: 8px;
+          font-weight: 600;
+          padding: 0.5rem 1rem;
+          border: 1px solid rgba(49, 51, 63, 0.2);
+          background-color: transparent;
+          color: inherit;
+          cursor: pointer;
+          font-size: 0.95rem;
+      ">{label}</button>
+    </div>
+    <script>
+      (function() {{
+        const btn = document.getElementById("{button_id}");
+        const originalLabel = btn.textContent;
+        btn.addEventListener("click", async function() {{
+          const text = {safe_text};
+          try {{
+            await navigator.clipboard.writeText(text);
+          }} catch (err) {{
+            const textarea = document.createElement("textarea");
+            textarea.value = text;
+            textarea.style.position = "fixed";
+            textarea.style.opacity = "0";
+            document.body.appendChild(textarea);
+            textarea.focus();
+            textarea.select();
+            try {{ document.execCommand("copy"); }} catch (e) {{}}
+            document.body.removeChild(textarea);
+          }}
+          btn.textContent = "✅ הועתק!";
+          setTimeout(function() {{ btn.textContent = originalLabel; }}, 1500);
+        }});
+      }})();
+    </script>
+    """
+    components.html(html_code, height=45)
 
 
 def get_api_key() -> str:
@@ -200,6 +252,14 @@ def extract_text_from_upload(api_key: str, uploaded_file) -> str:
     raise ValueError(f"סוג קובץ לא נתמך: .{extension}")
 
 
+HEBREW_QUALITY_GUIDELINES = (
+    "עליך לכתוב אך ורק בעברית תקנית, רהוטה, אקדמית וטבעית לחלוטין (רמת שפת אם גבוהה). "
+    "הימנע לחלוטין מתרגום מילולי מאנגלית (Literal translation) או מניסוחים שנשמעים כמו תרגום מכונה. "
+    "השתמש בפיסוק נכון, במשפטים מנוסחים היטב, בחלוקה נכונה לפסקאות, ובזרימת קריאה חלקה, "
+    "ללא טעויות דקדוק או הגהה."
+)
+
+
 def build_summary_system_prompt(focus: str) -> str:
     return (
         "אתה עוזר כתיבה מומחה בעברית תקנית וגבוהה. "
@@ -208,7 +268,8 @@ def build_summary_system_prompt(focus: str) -> str:
         "התמקד אך ורק בהיבט הבא שביקש המשתמש, והשמט כל מידע שאינו רלוונטי אליו: "
         f"\"{focus}\". "
         "אם התוכן אינו כולל מידע רלוונטי לנושא המבוקש, ציין זאת בבירור בעברית. "
-        "כתוב בסגנון ברור, קולח ומקצועי, בפסקאות מסודרות."
+        "כתוב בסגנון ברור, קולח ומקצועי, בפסקאות מסודרות.\n\n"
+        f"{HEBREW_QUALITY_GUIDELINES}"
     )
 
 
@@ -218,7 +279,8 @@ def build_followup_system_prompt() -> str:
         "בהמשך תקבל את התוכן המלא של המסמכים שהועלו, את הסיכום הממוקד שכבר הוכן מהם, "
         "ולבסוף שאלת המשך של המשתמשת. "
         "ענה על השאלה בעברית ברורה ומדויקת, בהתבסס אך ורק על התוכן המלא ועל הסיכום שסופקו לך. "
-        "אם התשובה לשאלה אינה נמצאת במידע שסופק, ציין זאת בבירור במקום לנחש."
+        "אם התשובה לשאלה אינה נמצאת במידע שסופק, ציין זאת בבירור במקום לנחש.\n\n"
+        f"{HEBREW_QUALITY_GUIDELINES}"
     )
 
 
@@ -341,6 +403,7 @@ if st.session_state.summary:
     st.subheader("📄 הסיכום")
     with st.container(border=True):
         st.markdown(st.session_state.summary)
+    render_copy_button(st.session_state.summary, key="summary")
     st.download_button(
         "הורידו את הסיכום כקובץ טקסט",
         data=st.session_state.summary.encode("utf-8"),
@@ -352,11 +415,12 @@ if st.session_state.summary:
     st.subheader("💬 שאלות המשך על הסיכום")
     st.caption("אפשר לשאול הבהרות נוספות על סמך כל התוכן שהועלה ועל סמך הסיכום שנוצר.")
 
-    for question, answer in st.session_state.qa_history:
+    for i, (question, answer) in enumerate(st.session_state.qa_history):
         with st.chat_message("user"):
             st.markdown(question)
         with st.chat_message("assistant"):
             st.markdown(answer)
+            render_copy_button(answer, key=f"qa-{i}")
 
     followup_question = st.chat_input("שאלו שאלה נוספת או בקשו הבהרה על הסיכום...")
 
@@ -378,5 +442,6 @@ if st.session_state.summary:
 
         with st.chat_message("assistant"):
             st.markdown(answer)
+            render_copy_button(answer, key=f"qa-{len(st.session_state.qa_history)}")
 
         st.session_state.qa_history.append((followup_question, answer))
